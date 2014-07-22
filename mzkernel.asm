@@ -89,16 +89,18 @@ THREAD_FLAG_MINCONTEXT		EQU	1
 ; struct THREAD
 ; {
 ;    BYTE flags;
-;    BYTE ThreadIndex;
+;    BYTE ThreadPriority;
 ;    KTHREAD* WaitListEntry;
+;    KTHREAD* NextThread;
 ;    CONTEXT context;
 ; }
 ;
 THREAD_FLAGS			EQU	0
-THREAD_INDEX			EQU	1
+THREAD_PRIORITY			EQU	1
 THREAD_WAIT_LIST_ENTRY		EQU	2
-THREAD_CONTEXT			EQU	4
-THREAD_SIZE			EQU	4+CONTEXT_SIZE
+THREAD_NEXT_THREAD		EQU	4
+THREAD_CONTEXT			EQU	6
+THREAD_SIZE			EQU	THREAD_CONTEXT+CONTEXT_SIZE
 
 
 
@@ -112,7 +114,6 @@ isr_stack	EQU	0
 
 
 ; Stack for the threads
-NUM_THREADS	EQU	3
 
 ;-------- Thread 0 init data
 THREAD_0_STACK_SIZE		EQU	32
@@ -151,8 +152,8 @@ start:	di
 ; (it will be copied to a thread context area later if necessary)
 ; R register is never saved or restored
 ; I register is never supposed to be changed by user code
-ISR:	ld	(isr_rgsav),sp
-	ld	sp,isr_stack
+ISR:	ld	(isr_stack-2),sp
+	ld	sp,isr_stack-2
 	push	af
 	push	hl
 	push	de
@@ -167,7 +168,7 @@ ISR:	ld	(isr_rgsav),sp
 	push	iy
 ; For possible thread preemption, put current thread as the first return candidate
 ; this is semantically KeRaiseIrql
-	ld	a,(current_thread)
+	ld	a,(current_thread_priority)
 	ld	(request_thread),a
 
 ; <------------------------ User ISR starts here
@@ -178,7 +179,7 @@ ISR:	ld	(isr_rgsav),sp
 ; <------------------------ User ISR ends here
 
 ; User ISR is finished. Check if a context switch is necessary (KeLowerIrql)
-isrend:	ld	hl,current_thread
+isrend:	ld	hl,current_thread_priority
 	ld	a,(request_thread)
 	cp	(hl)
 	jr	nc,irncs	;No higher-priority threads are ready
@@ -188,12 +189,9 @@ isrend:	ld	hl,current_thread
 	ld	de,THREAD_CONTEXT
 	add	hl,de
 	ex	de,hl
-	ld	hl,isr_stack-CONTEXT_SIZE+2	;SP can't be copied this way
-	ld	bc,CONTEXT_SIZE-2		;length of copyable portion of the context
+	ld	hl,isr_stack-CONTEXT_SIZE
+	ld	bc,CONTEXT_SIZE
 	ldir
-	ld	hl,isr_rgsav			;SP is saved here on ISR entry
-	ldi
-	ldi
 	ld	iy,(current_thread_ptr)
 	ld	ix,(request_thread_ptr)
 	res	THREAD_FLAG_MINCONTEXT,(iy+THREAD_FLAGS) ;Interrupt preemption, full context restoration
@@ -212,9 +210,49 @@ irncs:	pop	iy
 	pop	de
 	pop	hl
 	pop	af
-	ld	sp,(isr_rgsav)
+	ld	sp,(isr_stack-2)
 	ei
 	ret
+
+;-------------------------
+; KeExitThread
+; Ends a thread and removes it from the system thread list
+; Yields execution to the next ready thread
+; Must be called or jumped to at IRQL=PASSIVE from the thread that exits
+; Does not return
+KeExitThread:
+	di
+; Search for the current thread in the system thread list
+	ld	de,(current_thread_ptr)
+	ld	hl,(thread_list_head)
+	or	a
+	sbc	hl,de
+	jr	nz,kexth0
+; A separate path for deletion of the first thread
+	ld	ix,(thread_list_head)
+	ld	l,(ix+THREAD_NEXT_THREAD)
+	ld	h,(ix+THREAD_NEXT_THREAD+1)
+	ld	(thread_list_head),hl
+	push	de
+	pop	iy
+	jr	KiSwapThread
+kexth0:	add	hl,de
+	push	hl
+	pop	ix
+	ld	l,(ix+THREAD_NEXT_THREAD)
+	ld	h,(ix+THREAD_NEXT_THREAD+1)
+	or	a
+	sbc	hl,de
+	jr	nz,kexth0
+; The current thread reference is found somewhere in the list, IX=ref_thread, DE=cur_thread
+	ld	yh,d
+	ld	yl,e
+	ld	c,(iy+THREAD_NEXT_THREAD)
+	ld	b,(iy+THREAD_NEXT_THREAD+1)
+	ld	(ix+THREAD_NEXT_THREAD),c
+	ld	(ix+THREAD_NEXT_THREAD+1),b
+	jr	KiSwapThread
+
 
 ;=========================
 ; KeWaitForObject
@@ -258,18 +296,17 @@ KiSwapThread:
 ; Search for a thread with a lower priority to run
 ; (no threads with higher priority are guaranteed to be ready,
 ; otherwise the current thread would have been preeempted)
-	ld	a,(current_thread)
-	ld	b,a
-	ld	de,THREAD_SIZE
 	push	iy
 	pop	ix
-SWT_0:	add	ix,de
-	inc	b
+SWT_0:	ld	e,(ix+THREAD_NEXT_THREAD)
+	ld	d,(ix+THREAD_NEXT_THREAD+1)
+	ld	xh,d
+	ld	xl,e
 	bit	THREAD_FLAG_READY,(ix+THREAD_FLAGS)
 	jr	z,SWT_0
 ; A thread is found. Make it current
-	ld	a,b
-	ld	(current_thread),a
+	ld	a,(ix+THREAD_PRIORITY)
+	ld	(current_thread_priority),a
 	res	THREAD_FLAG_READY,(iy+THREAD_FLAGS)
 
 ;======================
@@ -315,11 +352,11 @@ KiRestoreContext:
 	pop	bc
 	pop	de
 	pop     hl
-	ld	(isr_rgsav),hl
+	ld	(rgsav),hl
 	pop	af
 	pop	hl
 	ld	sp,hl
-	ld	hl,(isr_rgsav)
+	ld	hl,(rgsav)
 	ei
 	ret
 ; Minimal context restoration
@@ -344,7 +381,7 @@ KeResetEvent:
 ; <IX - address of event
 ; uses all registers
 KeSetNotifEvent:
-	ld	a,(current_thread)
+	ld	a,(current_thread_priority)
 	di
 	ld	(request_thread),a
 	call	KeSetNotifEventFromIsr
@@ -386,7 +423,7 @@ ksne1:	ld	(ix+DISPOBJ_WAITLISTHEAD),e
 ; Returns at IRQL=passive, possibly after switching to another thread and back
 ; uses all registers
 KiLowerIrqlFromDispatch:
-	ld	hl,current_thread
+	ld	hl,current_thread_priority
 	ld	a,(request_thread)
 	cp	(hl)
 	jr	nc,eiret	;No higher-priority threads are waiting
@@ -405,7 +442,7 @@ KiUnwaitThread:
 	; Set the thread's state to Ready
 	set	THREAD_FLAG_READY,(iy+THREAD_FLAGS)
 	; Check if the thread's priority is higher than of any other requesters
-	ld	a,(iy+THREAD_INDEX)
+	ld	a,(iy+THREAD_PRIORITY)
 	ld	hl,request_thread
 	cp	(hl)
 	ret	nc
@@ -427,7 +464,7 @@ KeSetSynchrEvent:
 	ld	a,d
 	or	e
 	jp	z,eiret	;If no waiters, quick return
-	ld	a,(current_thread)
+	ld	a,(current_thread_priority)
 	ld	(request_thread),a
 	call	KiRemoveUnwaitSingleThread
 ; Check if we need to switch to that thread right now
@@ -468,22 +505,93 @@ KiRemoveUnwaitSingleThread:
 	jr	KiUnwaitThread
 
 
+;-------------------------
+; KeStartThread
+; Starts a new thread and schedules it for execution
+; New threads always start in Ready state
+; Can preempt current thread in favor of the new thread
+;  if the new thread's priority is higher
+; Must be called at IRQL=PASSIVE
+; <IY - address of the new thread
+; uses all registers
+KeStartThread:
+	di
+	ld	a,(current_thread_priority)
+	ld	(request_thread),a
+	call	KiStartThread
+	jr	KiLowerIrqlFromDispatch
+
+;-------------------------
+; KiStartThread
+; Starts a new thread by inserting it in the system thread list sorted by priority
+; Must be called at IRQL=DISPATCH_LEVEL
+; <IY - address of the new thread
+; uses HL,DE,BC,A,IX
+KiStartThread:
+	ld	ix,(thread_list_head)
+	ld	a,(iy+THREAD_PRIORITY)
+	cp	(ix+THREAD_PRIORITY)
+	jr	nc,kisth0
+; A separate path for insertion in the list head
+	ld	b,xh
+	ld	c,xl
+	ld	(iy+THREAD_NEXT_THREAD),c
+	ld	(iy+THREAD_NEXT_THREAD+1),b
+	ld	(thread_list_head),ix ;The new list head
+	jr	kisth1
+; Move on to the next thread
+kisth0:	ld	c,(ix+THREAD_NEXT_THREAD)
+	ld	b,(ix+THREAD_NEXT_THREAD+1)
+; Save the thread pointer for the next iteration
+	ld	d,xh
+	ld	e,xl
+	ld	xh,b
+	ld	xl,c
+	cp	(ix+THREAD_PRIORITY)
+	jr	nc,kisth0
+; A place for insertion is found
+	ld	b,xh
+	ld	c,xl
+	ld	(iy+THREAD_NEXT_THREAD),c
+	ld	(iy+THREAD_NEXT_THREAD+1),b
+	ld	xh,d
+	ld	xl,e
+	ld	b,yh
+	ld	c,yl
+	ld	(ix+THREAD_NEXT_THREAD),c
+	ld	(ix+THREAD_NEXT_THREAD+1),b
+; After insertion, compete for the highest priority
+kisth1:	ld	hl,request_thread
+	cp	(hl)
+	ret	nc
+; We are the highest requester
+	ld	(hl),a
+	ld	(request_thread_ptr),iy
+	ret
+
+
+
+
+
+
 ;====================================
 ;   Example threads
 ;====================================
 thread_0_entry:
-	ld	ix,event_0
+	ld	iy,thread_1
+	call	KeStartThread
+thr00:	ld	ix,event_0
 	call	KeWaitForObject
 	ld	ix,event_0
 	call	KeResetEvent
-	jr	thread_0_entry
+	jr	thr00
 
 thread_1_entry:
 	ld	ix,event_1
 	call	KeWaitForObject
 	ld	ix,event_0
 	call	KeSetSynchrEvent
-	jr	thread_1_entry
+	jp	KeExitThread
 
 thread_2_entry:
 	halt
@@ -494,27 +602,32 @@ thread_2_entry:
 ;   Data segment
 ;====================================
 
-current_thread:	db	0
-current_thread_ptr: dw	threads
+current_thread_priority:	db	0
+current_thread_ptr: dw	thread_0
+thread_list_head: dw thread_0
 
-
-threads:
-;-- Thread 0
+;-- Thread 0 (priority 0 = highest)
+thread_0:
 	db	3	;Flags: Ready, min-context
-	db	0	;Thread index (priority, lower=higher)
+	db	0	;Thread priority (lower=higher)
 	dw	0	;WaitListEntry
+	dw	thread_idle ;NextThread
 	ds	CONTEXT_SIZE-2
 	dw	thread_0_stack+THREAD_0_STACK_SIZE-2
-;-- Thread 1
+;-- Thread 1 (priority 1)
+thread_1:
 	db	3	;Flags: Ready, min-context
-	db	1	;Thread index (priority, lower=higher)
+	db	1	;Thread priority (lower=higher)
 	dw	0	;WaitListEntry
+	dw	0	;NextThread
 	ds	CONTEXT_SIZE-2
 	dw	thread_1_stack+THREAD_1_STACK_SIZE-2
-;-- Thread 2 (idle thread, must not wait)
+;-- System Idle Thread (priority 255, lowest, must not wait or exit)
+thread_idle:
 	db	3	;Flags: Ready, min-context
-	db	2	;Thread index (priority, lower=higher)
+	db	2	;Thread priority (lower=higher)
 	dw	0	;WaitListEntry
+	dw	0	;NextThread - has no meaning
 	ds	CONTEXT_SIZE-2
 	dw	thread_2_stack+THREAD_2_STACK_SIZE-2
 
@@ -546,7 +659,7 @@ last_addr_sav:
 request_thread:	ds	1
 request_thread_ptr: ds	2
 
-isr_rgsav:	ds	2
+rgsav:	ds	2
 
 
 	savebin "mzkernel.bin",start,last_addr_sav-start
